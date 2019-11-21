@@ -1,0 +1,16 @@
+version: '3.5'
+services:
+    web:
+        shm_size: '4gb'
+        image: cnet1
+        ports:
+            - "8000:8000"
+        environment:
+            DISPLAY: $DISPLAY
+            QT_X11_NO_MITSHM: 1
+        volumes:
+            - .:/app
+            - /home/nick/practice2019_/exp:/workspace/CenterNet/exp
+            - /media/nick/WORK6/YaDisk/Приложения/Яндекс.Толока.Песочница/dataset0/:/workspace/amedataimages
+            - /tmp/.X11-unix:/tmp/.X11-unix
+            - ~/.Xauthority:/root/.Xauthority
