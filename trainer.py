@@ -1,7 +1,12 @@
 import torch
+from numpy import recarray
 from torch.nn import DataParallel
 from tqdm import tqdm
 import sys
+from torch.nn.functional import max_pool2d
+import numpy as np
+import cv2
+import functools
 
 
 class ModelWithLoss(torch.nn.Module):
@@ -14,9 +19,9 @@ class ModelWithLoss(torch.nn.Module):
     def forward(self, batch):
         outputs = self.model(batch['input'])
         loss_value = 0
-        loss_stats = {key : 0.0 for key in self.loss}
+        loss_stats = {key: 0.0 for key in self.loss}
         for key, loss in self.loss.items():
-            loss_stats[key] = loss(outputs[-1][key], batch[key])
+            loss_stats[key] = batch["weight"] * loss(outputs[-1][key], batch[key])
 
         loss_value += sum({key: self.loss_weights[key] * val for key, val in loss_stats.items()}.values())
         return outputs[-1], loss_value, loss_stats
@@ -24,10 +29,13 @@ class ModelWithLoss(torch.nn.Module):
 
 class Trainer(object):
     def __init__(self, model, losses, loss_weights,  optimizer=None, num_iter=-1, print_iter=-1, device=None,
-                 batches_per_update=1):
+                 batches_per_update=1, k=20, thr=0.1, window_r=2):
         self.num_iter = num_iter
         self.print_iter = print_iter
         self.device = device
+        self.K = k
+        self.thr = thr
+        self.window_r = window_r
         self.batches_per_update = batches_per_update
         self.optimizer = optimizer
         self.loss = losses
@@ -46,7 +54,8 @@ class Trainer(object):
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device=device, non_blocking=True)
 
-    def run_epoch(self, phase, epoch, data_loader):
+    def run_epoch(self, phase, epoch, data_loader, require_predict):
+        debug = False
         model_with_loss = self.model_with_loss
         if phase == 'train':
             model_with_loss.train()
@@ -55,9 +64,12 @@ class Trainer(object):
             model_with_loss.eval()
             torch.cuda.empty_cache()
 
-        results = dict()
+        results = dict() if phase != "test" else []
+        predicts = []
+        current_predict = []
         moving_loss = 0
         num_iters = len(data_loader) if self.num_iter < 0 else self.num_iter
+        scales = data_loader.dataset.scales
         with tqdm(data_loader, file=sys.stdout) as bar_object:
             for iter_id, batch in enumerate(bar_object):
 
@@ -69,31 +81,116 @@ class Trainer(object):
                 if phase == 'train':
                     output, loss, loss_stats = model_with_loss(batch)
                     loss = loss.mean() / self.batches_per_update
-                else:
+                elif phase == "val":
                     with torch.no_grad():
                         output, loss, loss_stats = model_with_loss(batch)
                         loss = loss.mean() / self.batches_per_update
+                        if require_predict:
+                            rectangles = self.predict(output, image_id=iter_id // len(scales), down_ratio=4,
+                                                      scale=scales[iter_id % len(scales)])
+                            current_predict.extend(rectangles)
+                            if not ((iter_id+1) % len(scales)):
+                                current_predict = self.nms(current_predict)
+                                predicts.extend(current_predict)
+                                if debug:
+                                    cv2.startWindowThread()
+                                    img = (batch['input'][0, :, :, :].cpu().numpy().transpose(1, 2, 0) * 255).astype(
+                                        np.uint8).copy()
+                                    self.visualize(img, current_predict)
+                                current_predict = []
+                else:
+                    with torch.no_grad():
+                        output = model_with_loss.model(batch['input'])[-1]
+                        rectangles = self.predict(output, image_id=iter_id // len(scales), down_ratio=4)
+                        results.extend(rectangles)
                 if phase == 'train':
                     if iter_id % self.batches_per_update == 0:
                         self.optimizer.zero_grad()
                     loss.backward()
                     if (iter_id + 1) % self.batches_per_update == 0:
                         self.optimizer.step()
-                moving_loss += loss.item()
-                results = {key: results.get(key, 0) + val.mean().item() for (key,val) in loss_stats.items()}
-                bar_object.set_postfix_str("{phase}:[{epoch}]' loss={loss} {losses}".
-                                           format(phase=phase, epoch=epoch, loss=moving_loss / (iter_id +1),
-                                                  losses={k: v / (iter_id +1) for k, v in results.items()}))
+                if phase != "test":
+                    moving_loss += loss.item()
+                    results = {key: results.get(key, 0) + val.mean().item() for (key, val) in loss_stats.items()}
+                    del loss, loss_stats
+                    bar_object.set_postfix_str("{phase}:[{epoch}]' loss={loss} {losses}".
+                                               format(phase=phase, epoch=epoch, loss=moving_loss / (iter_id + 1),
+                                                      losses={k: v / (iter_id + 1) for k, v in results.items()}))
+                else:
+                    bar_object.set_postfix_str("{phase}:[{epoch}]".
+                                               format(phase=phase, epoch=epoch))
                 bar_object.update(1)
                 if self.print_iter > 0 and not (iter_id % self.print_iter):
                     bar_object.write(bar_object.__str__())
-                del output, loss, loss_stats
-        results = {k: v / len(data_loader) for k, v in results.items()}
-        results.update({'loss': moving_loss / len(data_loader)})
-        return results
+                del output
+        if phase != "test":
+            results = {k: v / len(data_loader) for k, v in results.items()}
+            results.update({'loss': moving_loss / len(data_loader)})
 
-    def val(self, epoch, data_loader):
-        return self.run_epoch('val', epoch, data_loader)
+        return (results, predicts) if require_predict else results
+
+    def val(self, epoch, data_loader, require_predict=False):
+        return self.run_epoch('val', epoch, data_loader, require_predict)
 
     def train(self, epoch, data_loader):
-        return self.run_epoch('train', epoch, data_loader)
+        return self.run_epoch('train', epoch, data_loader, require_predict=False)
+
+    def test(self, epoch, data_loader):
+        return self.run_epoch("test", epoch, data_loader, require_predict=False)
+
+    def predict(self, output, image_id, down_ratio=4, scale=1):
+        debug = False
+        super_class_dict = {0:0, 1:1, 2:0, 3:0,4:1,5:1}
+        extrema_map = (max_pool2d(output["center"], 2 * self.window_r + 1, stride=1) ==
+                       output['center'][:, :, self.window_r:-self.window_r, self.window_r:-self.window_r]).cpu()
+        points = extrema_map.nonzero()
+
+        smooth_wh = (max_pool2d(output['dim'], 2 * self.window_r + 1, stride=1)).cpu()
+        w = smooth_wh[0, 0, points[:, 2], points[:, 3]]
+        h = smooth_wh[0, 1, points[:, 2], points[:, 3]]
+
+        points[:, 2:] += self.window_r
+        cost = output['center'][0, points[:, 1], points[:, 2], points[:, 3]]
+        costs, idx = cost.topk(min(self.K, cost.shape[0]))
+        num_good = (costs.sigmoid() > self.thr).sum()
+        idx = idx[:num_good]
+        result = []
+        for i in idx:
+            rect = (int(points[i, 2].item() * down_ratio - h[i].item() * down_ratio) * scale,
+                    int(points[i, 3].item() * down_ratio - w[i].item() * down_ratio) * scale,
+                    int(2 * h[i].item()) * scale * down_ratio, int(2 * w[i].item()) * scale * down_ratio)
+            anno = super_class_dict[points[i, 1].item()]
+            result.append({"image_id": image_id, "bbox": rect, "category_id": anno, "score": cost[i].sigmoid().item()})
+        return result
+
+    def nms(self, boxes, thr=0.0):
+        boxes = list(sorted(boxes, key=functools.cmp_to_key(lambda x,y: y["score"]-x["score"])))
+        for i, box in enumerate(boxes):
+            rect = np.array(box["bbox"])
+            for box2 in boxes[i+1:]:
+
+                rect2 = np.array(box2["bbox"])
+                x_left = max(rect[0], rect2[0])
+                y_top = max(rect[1], rect2[1])
+                x_right = min(rect[0] + rect[2], rect2[0] + rect2[2])
+                y_bottom = min(rect[1] + rect[3], rect2[1] + rect2[3])
+                if x_right < x_left or y_bottom < y_top:
+                    intersection_area = 0
+                else:
+                    intersection_area = (x_right - x_left) * (y_bottom - y_top)
+                iou = intersection_area / (
+                        rect[2] * rect[3] + rect2[3] * rect2[2] - intersection_area)
+                if iou > thr:
+                    boxes.remove(box2)
+        return boxes
+
+    def visualize(self, img, boxes):
+        for box in boxes:
+            rect = box["bbox"]
+            score = box["score"]
+            cv2.rectangle(img, (rect[1], rect[0]), (rect[3] + rect[1], rect[2] + rect[0]),
+                          (255, int(255 * score), 0), 2)
+        cv2.imshow("123", img)
+        cv2.waitKey()
+
+

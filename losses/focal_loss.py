@@ -4,19 +4,21 @@ import torch
 
 class FocalLoss(Module):
 
-    def __init__(self, a=2, b=4):
+    def __init__(self, sigmoid=True,a=2, b=4):
         super(FocalLoss, self).__init__()
         self.a = a
         self.b = b
+        self.sigmoid = sigmoid
 
-    def forward(self, pred, gt):
-        pos_inds = gt.gt(0.5).float()
-        neg_inds = gt.lt(0.5).float()
+    def forward(self, predict, gt):
+        pred = predict[:, :, :gt.shape[2], :gt.shape[3]]
+        pos_inds = gt.gt(0.99).float()
+        neg_inds = gt.lt(0.99).float()
 
         neg_weights = torch.pow(1 - gt, self.b).float()
         loss = 0
 
-        map = pred.sigmoid().clamp(1e-07, 1 - 1e-07)
+        map = pred.sigmoid().clamp(1e-07, 1 - 1e-07) if self.sigmoid else pred.clamp(1e-07, 1 - 1e-07)
 
         pos_loss = torch.log(map) * torch.pow(1 - map, self.a) * pos_inds
         neg_loss = torch.log(1 - map) * torch.pow(map, self.a) * neg_weights * neg_inds
@@ -32,5 +34,7 @@ class FocalLoss(Module):
         return loss
 
 
-def get_focal_loss(a=2, b=4):
-    return FocalLoss(a, b)
+def get_focal_loss(sigmoid=True, a=2, b=4):
+    def get_loss(sigmoid=True, a=2, b=4):
+        return FocalLoss(sigmoid, a, b)
+    return get_loss

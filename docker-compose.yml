@@ -10,7 +10,9 @@ services:
             QT_X11_NO_MITSHM: 1
         volumes:
             - .:/app
-            - /home/nick/practice2019_/exp:/workspace/CenterNet/exp
-            - /media/nick/WORK6/YaDisk/Приложения/Яндекс.Толока.Песочница/dataset0/:/workspace/amedataimages
+            - /home/nick/coco:/workspace/coco
+            - /home/nick/Загрузки:/workspace/singapore
+            - /home/nick/practice2019_/exp/default:/opt/project/exp/default
+            - /home/nick/Загрузки/DATASET:/workspace/amedataimages
             - /tmp/.X11-unix:/tmp/.X11-unix
             - ~/.Xauthority:/root/.Xauthority

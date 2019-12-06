@@ -1,9 +1,3 @@
-# ------------------------------------------------------------------------------
-# Copyright (c) Microsoft
-# Licensed under the MIT License.
-# Written by Bin Xiao (Bin.Xiao@microsoft.com)
-# Modified by Dequan Wang and Xingyi Zhou
-# ------------------------------------------------------------------------------
 
 from __future__ import absolute_import
 from __future__ import division
@@ -163,13 +157,13 @@ class PoseResNet(nn.Module):
                   nn.Conv2d(64, head_conv, kernel_size=3, padding=1, bias=True),
                   nn.ReLU(inplace=True),
                   nn.Conv2d(head_conv, classes, kernel_size=1, stride=1, padding=0, bias=True))
-                if 'hm' in head:
+                if 'center' in head:
                     fc[-1].bias.data.fill_(-2.19)
                 else:
                     fill_fc_weights(fc)
             else:
                 fc = nn.Conv2d(64, classes, kernel_size=1, stride=1, padding=0, bias=True)
-                if 'hm' in head:
+                if 'center' in head:
                     fc.bias.data.fill_(-2.19)
                 else:
                     fill_fc_weights(fc)
@@ -256,7 +250,14 @@ class PoseResNet(nn.Module):
         ret = {}
         for head in self.heads:
             ret[head] = self.__getattr__(head)(x)
-        ret['wh'] *= torch.max(ret["center"].sigmoid(), 1, keepdim=True)[0]
+        # ret['wh'] *= torch.max(ret["center"].sigmoid(), 1, keepdim=True)[0]
+        if "super" in self.heads:
+            ret["super"][:, 0, :, :] = (ret["center"][:, 0, :, :].sigmoid() +
+                                                      ret["center"][:, 2, :, :].sigmoid() +
+                                                      ret["center"][:, 3, :, :].sigmoid()) / 3
+            ret["super"][:, 1, :, :] = (ret["center"][:, 1, :, :].sigmoid() +
+                                                    ret["center"][:, 5, :, :].sigmoid() +
+                                                    ret["center"][:, 4, :, :].sigmoid()) / 3
         return [ret]
 
     def get_head_params(self):
@@ -272,6 +273,10 @@ class PoseResNet(nn.Module):
         for head in self.heads:
             params += list(self.__getattr__(head).parameters())
         return params
+
+    def set_group_param(self, group):
+        params_map = {0: self.get_head_params, 1: self.get_deconv_params, 2: self.parameters}
+        return params_map[group]()
 
     def init_weights(self, num_layers):
         if 1:
