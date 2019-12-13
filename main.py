@@ -23,12 +23,11 @@ def test(coco_gt, coco_pred):
 
 if __name__ == '__main__':
     opt = opts().parse()
-
     torch.manual_seed(opt.seed)
-    #torch.set_default_tensor_type(torch.cuda.FloatTensor)
+    torch.set_default_tensor_type(torch.cuda.FloatTensor)
     torch.backends.cudnn.benchmark = True
     train_dataset = TolokaDataset(
-        "/workspace/singapore/train_data2.tsv",
+        "/workspace/singapore/train_data.tsv",
         ("amedataimages", "/workspace/amedataimages"),
         transforms=torchvision.transforms.Compose([
             torchvision.transforms.ToPILImage(),
@@ -38,28 +37,28 @@ if __name__ == '__main__':
         ]),
         down_ratio=opt.down_ratio, output_dim=opt.input_res, rotate=opt.rotate)
     val_dataset = TolokaDataset(
-        "/workspace/singapore/val_data2.tsv",
+        "/workspace/singapore/val_data.tsv",
         ("amedataimages", "/workspace/amedataimages"),
         scales=(2,),
         down_ratio=opt.down_ratio, output_dim=opt.input_res, augment=False)
 
     test_dataset = TolokaDataset(
-        "/workspace/singapore/val_data2.tsv",
+        "/workspace/singapore/test_data.tsv",
         ("amedataimages", "/workspace/amedataimages"),
-        scales=(4, 2, 1),
+        scales=(2, 1),
         down_ratio=opt.down_ratio, output_dim=opt.input_res, augment=False)
     print(opt)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = opt.gpus_str
     opt.device = device('cuda' if opt.gpus[0] >= 0 else 'cpu')
 
-    model = create_model(opt.arch, {"center": train_dataset.num_classes, "dim": 2}, opt.head_conv)
+    model = create_model(opt.arch, {"center": train_dataset.num_classes, "dim": 2}, opt.head_conv, opt.attention)
     params = model.set_group_param(opt.train_params)
     optimizer = torch.optim.Adam(params, opt.lr)
     start_epoch = 0
     if opt.load_model != '':
         model, optimizer, start_epoch = load_model(
-            model, opt.load_model, optimizer, opt.resume, opt.lr, opt.lr_step)
+            model, opt.load_model, optimizer, opt.resume, opt.lr, opt.lr_step, opt.lr_factor)
     losses = {"center":  create_loss("focal_loss"), "dim": create_loss("l1_sparse_loss")}
     loss_weights = {"center": opt.center_weight, "dim": opt.wh_weight}
     trainer = Trainer(model, losses, loss_weights, optimizer=optimizer, device=opt.device, print_iter=opt.print_iter,
@@ -91,68 +90,77 @@ if __name__ == '__main__':
         pin_memory=True,
         drop_last=True
     )
+    if opt.test:
+        log_dict_val = trainer.val(start_epoch, val_loader, require_predict=True)
+        coco = val_dataset.coco(True)
+        json.dump(log_dict_val[1], open(opt.save_dir + "/predict.json", "w"))
+        coco_predicts = coco.loadRes(opt.save_dir + "/predict.json")
+        test(coco, coco_predicts)
+    else:
+        best = 1e10
+        coco = None
+        lr = opt.lr
+        logger = Logger(opt.save_dir, opt.resume)
+        for epoch in range(start_epoch + 1, opt.num_epochs + 1):
+            mark = epoch if opt.save_all else 'last'
+            log_dict_train = trainer.train(epoch, train_loader)
+            if opt.val_intervals > 0 and not(epoch % opt.val_intervals):
+                save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(mark)),
+                           epoch, model, optimizer)
+                require_predict = opt.test_intervals > 0 and not(epoch / opt.val_intervals % opt.test_intervals)
+                with torch.no_grad():
+                    if require_predict:
+                        log_dict_val = trainer.val(epoch, test_loader, require_predict=require_predict)
+                    else:
+                        log_dict_val = trainer.val(epoch, val_loader, require_predict=require_predict)
 
-    best = 1e10
-    coco = None
-    logger = Logger(opt.save_dir, opt.resume)
-    for epoch in range(start_epoch + 1, opt.num_epochs + 1):
-        mark = epoch if opt.save_all else 'last'
-        log_dict_train = trainer.train(epoch, train_loader)
-        if opt.val_intervals > 0 and not(epoch % opt.val_intervals):
-            save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(mark)),
-                       epoch, model, optimizer)
-            require_predict = opt.test_intervals > 0 and not(epoch / opt.val_intervals % opt.test_intervals)
-            with torch.no_grad():
+                logger.log(epoch, log_dict_train, log_dict_val[0] if require_predict else log_dict_val)
+
                 if require_predict:
-                    log_dict_val = trainer.val(epoch, test_loader, require_predict=require_predict)
-                else:
-                    log_dict_val = trainer.val(epoch, val_loader, require_predict=require_predict)
+                    if not coco:
+                        coco = val_dataset.coco(True)
+                    json.dump(log_dict_val[1], open(opt.save_dir + "/predict.json", "w"))
+                    coco_predicts = coco.loadRes(opt.save_dir + "/predict.json")
+                    test(coco, coco_predicts)
 
-            logger.log(epoch, log_dict_train, log_dict_val[0] if require_predict else log_dict_val)
+                loss = log_dict_val[0]["loss"] if require_predict else log_dict_val["loss"]
+                if loss < best:
+                    best = loss
+                    save_model(os.path.join(opt.save_dir, 'model_best.pth'),
+                               epoch, model)
+            else:
+                save_model(os.path.join(opt.save_dir, 'model_last.pth'),
+                           epoch, model, optimizer)
+                logger.log(epoch, log_dict_train, {})
+            if epoch in opt.lr_step:
+                save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
+                           epoch, model, optimizer)
+                lr = opt.lr * ((1 / opt.lr_factor) ** (opt.lr_step.index(epoch) + 1))
+                print('Drop LR to', lr)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+                model, optimizer, start_epoch = load_model(
+                    model, os.path.join(opt.save_dir, 'model_best.pth'), optimizer, True, opt.lr, opt.lr_step,
+                    opt.lr_factor, epoch=epoch)
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
 
-            if require_predict:
-                if not coco:
-                    coco = val_dataset.coco(True)
-                json.dump(log_dict_val[1], open(opt.save_dir + "/predict.json", "w"))
-                coco_predicts = coco.loadRes(opt.save_dir + "/predict.json")
-                test(coco, coco_predicts)
+            if epoch in opt.params_step:
+                save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
+                           epoch, model, optimizer)
+                opt.train_params += 1
+                model, _, start_epoch = load_model(
+                    model, os.path.join(opt.save_dir, 'model_best.pth'), optimizer, True, opt.lr, opt.lr_step,
+                    opt.lr_factor, epoch=epoch)
 
-            loss = log_dict_val[0]["loss"] if require_predict else log_dict_val["loss"]
-            if loss < best:
-                best = loss
-                save_model(os.path.join(opt.save_dir, 'model_best.pth'),
-                           epoch, model)
-        else:
-            save_model(os.path.join(opt.save_dir, 'model_last.pth'),
-                       epoch, model, optimizer)
-            logger.log(epoch, log_dict_train, {})
-        if epoch in opt.lr_step:
-            save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
-                       epoch, model, optimizer)
-            lr = opt.lr * ((1 / opt.lr_factor) ** (opt.lr_step.index(epoch) + 1))
-            print('Drop LR to', lr)
-            for param_group in optimizer.param_groups:
-                param_group['lr'] = lr
-            model, optimizer, start_epoch = load_model(
-                model, os.path.join(opt.save_dir, 'model_best.pth'), optimizer, True, lr, opt.lr_step)
-
-        if epoch in opt.params_step:
-            save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
-                       epoch, model, optimizer)
-            opt.train_params += 1
-            lr = opt.lr * ((1 / opt.lr_factor) ** (opt.lr_step.index(epoch) + 1))
-
-            model, _, start_epoch = load_model(
-                model, os.path.join(opt.save_dir, 'model_best.pth'), optimizer, True, lr, opt.lr_step)
-
-            params = model.set_group_param(opt.train_params)
-            optimizer = torch.optim.Adam(params, lr)
-            trainer.optimizer = optimizer
-            print("changle params to ", opt.train_params)
-
-
-        if epoch in opt.batch_step:
-            save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
-                       epoch, model, optimizer)
-            opt.batches_per_update *= 2
-            print('Increase Batch size to', opt.batches_per_update * opt.batch_size)
+                params = model.set_group_param(opt.train_params)
+                optimizer = torch.optim.Adam(params, lr)
+                trainer.optimizer = optimizer
+                for param_group in optimizer.param_groups:
+                    param_group['lr'] = lr
+                print("change params to ", opt.train_params)
+            if epoch in opt.batch_step:
+                save_model(os.path.join(opt.save_dir, 'model_{}.pth'.format(epoch)),
+                           epoch, model, optimizer)
+                opt.batches_per_update *= 2
+                print('Increase Batch size to', opt.batches_per_update * opt.batch_size)

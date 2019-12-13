@@ -1,5 +1,5 @@
 from torchvision import models
-
+from .attention import Attention
 try:
     from torch.hub import load_state_dict_from_url
 except ImportError:
@@ -7,9 +7,7 @@ except ImportError:
 
 import torch.nn as nn
 import torch
-from torchsummary import summary
 from .DCNv2.dcn_v2 import DCN
-import time
 
 __all__ = ['MobileNetV2', 'mobilenet_v2']
 
@@ -46,7 +44,6 @@ class ConvBNReLU(nn.Sequential):
             super(ConvBNReLU, self).__init__(
                 nn.Upsample(scale_factor=2),
                 nn.Conv2d(in_planes, out_planes, kernel_size, stride=1, padding=padding,
-                          #output_padding=padding if stride>1 else 0,
                           groups=groups, bias=False),
                 nn.BatchNorm2d(out_planes),
                 nn.ReLU6(inplace=True)
@@ -60,18 +57,13 @@ class ConvBNReLU(nn.Sequential):
 
 
 class InvertedResidual(nn.Module):
-    def __init__(self, inp, oup, stride, expand_ratio, transposed = False):
+    def __init__(self, inp, oup, stride, expand_ratio, transposed=False):
         super(InvertedResidual, self).__init__()
         self.stride = stride
         assert stride in [1, 2]
 
         hidden_dim = int(round(inp * expand_ratio))
         self.use_res_connect = self.stride == 1 and inp == oup
-
-       # if stride>1 and transposed:
-       #     expand_ratio = 1 / (expand_ratio +2)
-       # elif transposed:
-       #     expand_ratio = 1 / expand_ratio
 
         layers = []
         if expand_ratio != 1:
@@ -95,7 +87,7 @@ class InvertedResidual(nn.Module):
 
 
 class MobileNetV2(nn.Module):
-    def __init__(self, num_classes=1000, width_mult=1.0, inverted_residual_setting=None, round_nearest=8, up=False):
+    def __init__(self, width_mult=1.0, inverted_residual_setting=None, round_nearest=8, up=False):
         """
         MobileNet V2 main class
         Args:
@@ -125,16 +117,13 @@ class MobileNetV2(nn.Module):
             else:
                 inverted_residual_setting = list(reversed([
                     # t, c, n, s
-                    #[1, 16, 1, 1],
                     [1, 24, 1, 2],
                     [6, 32, 2, 2],
                     [6, 64, 3, 1],
                     [6, 96, 4, 2],
                     [6, 160, 3, 1],
                     [1, 320, 1, 2]
-                    #[5, 480, 1, 1]
                 ]))
-                #inverted_residual_setting.reverse()
         # only check the first element, assuming user knows t,c,n,s are required
         if len(inverted_residual_setting) == 0 or len(inverted_residual_setting[0]) != 4:
             raise ValueError("inverted_residual_setting should be non-empty "
@@ -143,13 +132,15 @@ class MobileNetV2(nn.Module):
         # building first layer
         input_channel = _make_divisible(input_channel * width_mult, round_nearest)
         self.last_channel = _make_divisible(last_channel * max(1.0, width_mult), round_nearest)
-        features = [block(320, inverted_residual_setting[0][1], stride=2, expand_ratio= 1, transposed=False)] if up else [ConvBNReLU(3, input_channel, stride=2)]
+        features = [block(320, inverted_residual_setting[0][1],
+                          stride=2, expand_ratio=1,
+                          transposed=False)] if up else [ConvBNReLU(3, input_channel, stride=2)]
         # building inverted residual blocks
         for t, c, n, s in inverted_residual_setting:
             output_channel = _make_divisible(c * width_mult, round_nearest)
             for i in range(n):
                 stride = s if i == 0 else 1
-                ratio =  min(t, 1) if stride >1 and up else t
+                ratio = min(t, 1) if stride > 1 and up else t
                 features.append(block(input_channel, output_channel, stride, expand_ratio=ratio, transposed=up))
                 input_channel = output_channel
         # building last several layers
@@ -158,12 +149,9 @@ class MobileNetV2(nn.Module):
         # make it nn.Sequential
         self.features = nn.Sequential(*features)
 
-
-
-        # building classifier
         self.classifier = nn.Sequential(
             nn.Dropout(0.2),
-            nn.Linear(self.last_channel, num_classes),
+            nn.Linear(self.last_channel, 1000),
         )
 
         # weight initialization
@@ -182,10 +170,7 @@ class MobileNetV2(nn.Module):
     def forward(self, x):
         x = self.features(x)
         x = x.mean(3).mean(2)
-        if self.classifier:
-            x = self.classifier(x)
         return x
-
 
 
 def fill_fc_weights(layers):
@@ -196,6 +181,7 @@ def fill_fc_weights(layers):
             # torch.nn.init.xavier_normal_(m.weight.data)
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
+
 
 def mobilenet_v2(pretrained=False, progress=True, **kwargs):
     """
@@ -212,9 +198,10 @@ def mobilenet_v2(pretrained=False, progress=True, **kwargs):
         model.load_state_dict(state_dict)
     return model
 
-class MobileNetDetect(torch.nn.Module):
 
-    def _get_deconv_cfg(self, deconv_kernel, index):
+class MobileNetDetect(torch.nn.Module):
+    @staticmethod
+    def _get_deconv_cfg(deconv_kernel):
         if deconv_kernel == 4:
             padding = 1
             output_padding = 0
@@ -234,19 +221,12 @@ class MobileNetDetect(torch.nn.Module):
             'ERROR: num_deconv_layers is different len(num_deconv_filters)'
 
         layers = []
-        self.inplanes=320
+        self.inplanes = 320
         for i in range(num_layers):
             kernel, padding, output_padding = \
-                self._get_deconv_cfg(num_kernels[i], i)
-
+                self._get_deconv_cfg(num_kernels[i])
             planes = num_filters[i]
-            fc = DCN(self.inplanes, planes,
-                    kernel_size=(3,3), stride=1,
-                    padding=1, dilation=1, deformable_groups=1)
-            # fc = nn.Conv2d(self.inplanes, planes,
-            #         kernel_size=3, stride=1,
-            #         padding=1, dilation=1, bias=False)
-            # fill_fc_weights(fc)
+            fc = DCN(self.inplanes, planes, kernel_size=(3, 3), stride=1, padding=1, dilation=1, deformable_groups=1)
             up = nn.ConvTranspose2d(
                     in_channels=planes,
                     out_channels=planes,
@@ -255,27 +235,26 @@ class MobileNetDetect(torch.nn.Module):
                     padding=padding,
                     output_padding=output_padding,
                     bias=False)
-            #fill_up_weights(up)
 
             layers.append(fc)
             layers.append(nn.BatchNorm2d(planes, momentum=0.1))
             layers.append(nn.ReLU(inplace=True))
             layers.append(up)
             layers.append(nn.BatchNorm2d(planes, momentum=0.1))
+            if self.attention:
+                layers.append(Attention(planes, 16))
             layers.append(nn.ReLU(inplace=True))
             self.inplanes = planes
 
         return nn.Sequential(*layers)
-    def __init__(self, heads, head_conv):
+
+    def __init__(self, heads, head_conv, attention=False):
         super(MobileNetDetect, self).__init__()
         self.backbone = mobilenet_v2(True)
         self.backbone.classifier = None
-
-        #self.map = mobilenet_v2(pretrained=False, up=True)
-        #self.map.classifier = None
-
         self.heads = heads
         self.head_conv = head_conv
+        self.attention = attention
 
         self.deconv_layers = self._make_deconv_layer(
             3,
@@ -286,23 +265,13 @@ class MobileNetDetect(torch.nn.Module):
         for head in self.heads:
             classes = self.heads[head]
             if head_conv > 0:
-                # fc = nn.Sequential(
-                #   nn.Conv2d(24, head_conv,
-                #     kernel_size=3, padding=1, bias=True),
-                #   nn.ReLU(inplace=True),
-                #   nn.Conv2d(head_conv, classes,
-                #     kernel_size=1, stride=1,
-                #     padding=0, bias=True))
-                fc = nn.Sequential(#24
+                fc = nn.Sequential(
                     nn.Conv2d(64, head_conv,
                               kernel_size=1, padding=0, bias=True),
                     nn.ReLU(inplace=True),
                     nn.Conv2d(head_conv, head_conv,
                               kernel_size=3, padding=1, groups=head_conv, bias=True),
                     nn.ReLU(inplace=True),
-                    #nn.Conv2d(2 * head_conv, head_conv,
-                    #          kernel_size=1, padding=0, bias=True),
-                    #nn.ReLU(inplace=True),
                     nn.Conv2d(head_conv, classes,
                               kernel_size=1, stride=1,
                               padding=0, bias=True))
@@ -311,72 +280,47 @@ class MobileNetDetect(torch.nn.Module):
                 else:
                     fill_fc_weights(fc)
             else:
-                fc = nn.Conv2d(24, classes,
-                  kernel_size=1, stride=1,
-                  padding=0, bias=True)
+                fc = nn.Conv2d(24, classes, kernel_size=1, stride=1, padding=0, bias=True)
                 if 'hm' in head:
                     fc.bias.data.fill_(-2.19)
                 else:
                     fill_fc_weights(fc)
             self.__setattr__(head, fc)
 
-        # print(self.backbone)
-        # summary(self.backbone.cuda(), input_size=(3,512,512))
-        # print(self.map)
-        # summary(self.map.cuda(), input_size=(1280, 16, 16))
-        # print(0)
-
     def forward(self, input):
-        #y = self.backbone(input)
-       # with torch.no_grad():
         backbone_layers = list(list(self.backbone.children())[0].children())
         backbone_scales = [backbone_layers[0](input)]
         y = backbone_scales[0]
-        #start = time.time()
         for layer in backbone_layers[1:-1]:
-            #start = time.time()
             ny = layer(y)
-            #print(time.time()-start)
-            if(ny.shape!=y.shape):
+            if ny.shape != y.shape:
                 backbone_scales.append(y)
             y = ny
-        backbone_scales.append(y)
-        #start = time.time()
-        #y = backbone_layers[-1](y)
-        #print('g',time.time() - start)
-
-        #map_layers = list(list(self.map.children())[0].children())
-
-        #start = time.time()
-        #with torch.autograd.profiler.profile(use_cuda=True) as prof:
-        if False:
-            map_layers = list(list(self.map.children())[0].children())
-            for layer in map_layers:
-                #sstart = time.time()
-                ny = layer(y)
-                #print(layer,time.time() - sstart)
-                if(backbone_scales[-1].shape==ny.shape):
-                    ny += backbone_scales.pop()
-                y = ny
-        else:
-            y = self.deconv_layers(y)
-        #print('m',time.time() - start)
-        #print(prof)
-        #start = time.time()
+        y = self.deconv_layers(y)
         ret = {}
         for head in self.heads:
             ret[head] = self.__getattr__(head)(y)
-        #print(time.time() - start)
         return [ret]
-    def get_end_params(self):
-        #params = list(self.map.parameters())
-        params = list(self.deconv_layers.parameters())
+
+    def get_head_params(self):
+        params = []
         for head in self.heads:
             params += list(self.__getattr__(head).parameters())
-        return  params
+        return params
+
+    def get_deconv_params(self):
+        params = []
+        for layer in list(self.deconv_layers.children())[0:]:
+            params += list(layer.parameters())
+        for head in self.heads:
+            params += list(self.__getattr__(head).parameters())
+        return params
+
+    def set_group_param(self, group):
+        params_map = {0: self.get_head_params, 1: self.get_deconv_params, 2: self.parameters}
+        return params_map[group]()
 
 
-def get_mobile_net(num_layers=100500,heads=100500, head_conv=100500):
-    net = MobileNetDetect(heads, head_conv)
-    summary(net.cuda(), input_size=(3, 512, 512))
+def get_mobile_net(heads, head_conv, attention=False):
+    net = MobileNetDetect(heads, head_conv, attention)
     return net

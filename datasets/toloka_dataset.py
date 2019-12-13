@@ -6,18 +6,19 @@ import json
 import cv2
 from pycocotools.coco import COCO
 
-def gaussian2D(shape, bias, sigma=(1, 1), scale=1):
-    m, n = [(ss - 1.) / 2. for ss in shape]
-    y, x = np.ogrid[-m:m+1,-n:n+1]
 
-    h = scale * np.exp(-((x + bias[1]) * (x + bias[1]) / sigma[1] **2 + (y + bias[0]) * (y + bias[0]) / sigma[0] ** 2))
+def gaussian2d(shape, bias, sigma=(1, 1), scale=1):
+    m, n = [(ss - 1.) / 2. for ss in shape]
+    y, x = np.ogrid[-m:m+1, -n:n+1]
+
+    h = scale * np.exp(-((x + bias[1]) * (x + bias[1]) / sigma[1] ** 2 + (y + bias[0]) * (y + bias[0]) / sigma[0] ** 2))
     h[h < np.finfo(h.dtype).eps * h.max()] = 0
     return h
 
 
 def draw_gaussian(image, rect, shape_bias, sigma, scale=1):
     image[rect[0]:rect[2], rect[1]:rect[3]] = np.maximum(image[rect[0]:rect[2], rect[1]:rect[3]],
-                                                         gaussian2D((rect[2] - rect[0], rect[3] - rect[1]),
+                                                         gaussian2d((rect[2] - rect[0], rect[3] - rect[1]),
                                                                     shape_bias, sigma, scale))
     return image
 
@@ -39,11 +40,9 @@ class TolokaDataset(Dataset):
         self.output_dim = output_dim
         self.augment = augment
         self.rotate = rotate
-        self.pad = 31
         self.Coco = None
         self.transforms = transforms
         self.scales = scales
-        cv2.startWindowThread()
 
     def summary(self):
         stats = np.zeros((self.num_classes,))
@@ -75,14 +74,15 @@ class TolokaDataset(Dataset):
                 for rect in anno:
                     bbox = list(self.relative_bbox2absolute(rect["data"], shape[:2]))
                     bbox = [int(bbox[0]), int(bbox[1]), int(bbox[2] - bbox[0]), int(bbox[3] - bbox[1])]
-                    category_id = self.super_class_dict.get(rect["annotation"], 5) if super_class else\
-                        self.label_dict.get(rect["annotation"], 5)
-                    area = int(bbox[3] * bbox[2])
-                    image_id = i
-                    id = anno_id
-                    anno_id += 1
-                    annotations.append({"bbox": bbox, "category_id": category_id, "area": area, "image_id": image_id,
-                                        "id": id, "iscrowd": 0})
+                    if bbox[2] * bbox[3] > self.MIN_OBJECT_AREA:
+                        category_id = self.super_class_dict.get(rect["annotation"], 5) if super_class else\
+                            self.label_dict.get(rect["annotation"], 5)
+                        area = int(bbox[3] * bbox[2])
+                        image_id = i
+                        _id = anno_id
+                        anno_id += 1
+                        annotations.append({"bbox": bbox, "category_id": category_id,
+                                            "area": area, "image_id": image_id, "id": _id, "iscrowd": 0, "score": 1.0})
             self.Coco = COCO()
             self.Coco.dataset = {"images": images, "categories": categories, "annotations": annotations}
             self.Coco.createIndex()
@@ -90,10 +90,8 @@ class TolokaDataset(Dataset):
 
     @staticmethod
     def relative_bbox2absolute(rect, image_shape):
-        box = (np.clip(rect["p1"]["y"], 0, 1) * image_shape[0],
-                np.clip(rect["p1"]["x"], 0, 1) * image_shape[1],
-                np.clip(rect["p2"]["y"], 0, 1) * image_shape[0],
-                np.clip(rect["p2"]["x"], 0, 1) * image_shape[1])
+        box = (np.clip(rect["p1"]["y"], 0, 1) * image_shape[0], np.clip(rect["p1"]["x"], 0, 1) * image_shape[1],
+               np.clip(rect["p2"]["y"], 0, 1) * image_shape[0], np.clip(rect["p2"]["x"], 0, 1) * image_shape[1])
         if box[0] > box[2]:
             box = box[2], box[1], box[0], box[3]
         if box[1] > box[3]:
@@ -135,12 +133,7 @@ class TolokaDataset(Dataset):
         if self.augment:
             image_w = self.output_dim
             image_h = self.output_dim
-            # w_border = 128
-            # h_border = 128
-            c = np.zeros((2,))
 
-            # c[0] = np.random.randint(low=w_border, high=img.shape[1] - w_border)
-            # c[1] = np.random.randint(low=h_border, high=img.shape[0] - h_border)
             angle = self.rotate * np.random.uniform(-1, 1)
             rotate_mat = cv2.getRotationMatrix2D((img.shape[1] / 2, img.shape[0] / 2), angle, 1)
             rect = cv2.transform(
@@ -170,9 +163,6 @@ class TolokaDataset(Dataset):
                 s_high = min(img.shape[0] - center_point[0] - 1,
                              img.shape[1] - center_point[1] - 1, center_point[0], center_point[1])
                 size = s_high if s_low >= s_high else np.random.randint(s_low,  int(s_high))
-                # print("idx",  self.relative_bbox2absolute(ann['data'], img.shape), border, area, size)
-                #       # center_point + size, center_point - size, max_scale, border, c, sigma)
-                # idx = choice
             else:
                 c = (img.shape[0] / 2, img.shape[1] / 2)
                 sigma = (max((img.shape[0] - 2 * border), 0) / 6, max(0, (img.shape[1] - 2 * border)) / 6)
@@ -185,16 +175,14 @@ class TolokaDataset(Dataset):
                 s_high = min(img.shape[0] - center_point[0] - 1,
                              img.shape[1] - center_point[1] - 1, center_point[0], center_point[1])
                 size = s_high if s_low >= s_high else np.random.randint(s_low,  int(s_high))
-                # print("center")
-                # idx = -1
 
             rect = cv2.transform(
                 np.array([[[0, 0]], [[img.shape[1], 0]], [[0, img.shape[0]]], [[img.shape[1], img.shape[0]]]],
                          dtype=np.float32), rotate_mat)[:, 0, :]
-            image = cv2.warpAffine(img, rotate_mat, (np.max(rect[:, 0]), np.max(rect[:, 1])), flags=cv2.INTER_LINEAR)
+            img = cv2.warpAffine(img, rotate_mat, (np.max(rect[:, 0]), np.max(rect[:, 1])), flags=cv2.INTER_LINEAR)
             sample = img[center_point[0] - size:center_point[0] + size,
-                     center_point[1] - size: center_point[1] + size, :].copy()
-            image = cv2.resize(sample, (self.output_dim, self.output_dim))#.transpose(2, 0, 1)
+                         center_point[1] - size: center_point[1] + size, :].copy()
+            image = cv2.resize(sample, (self.output_dim, self.output_dim))
             trans_output = cv2.getAffineTransform(np.array([[center_point[0] - size, center_point[1] - size],
                                                             [center_point[0] + size, center_point[1] - size],
                                                             [center_point[0] - size, center_point[1] + size]],
@@ -202,11 +190,10 @@ class TolokaDataset(Dataset):
                                                   np.array([[0, 0], [self.output_dim, 0], [0, self.output_dim]],
                                                            dtype=np.float32))
         else:
-            trans_output = cv2.getRotationMatrix2D((0,0), 0, 1)
+            trans_output = cv2.getRotationMatrix2D((0, 0), 0, 1)
             image_w = img.shape[0]
             image_h = img.shape[1]
             image = img
-
 
         # for anno in annotation:
         # # if idx != -1:
@@ -232,7 +219,7 @@ class TolokaDataset(Dataset):
             c = np.sqrt(trans_output[0, 0] ** 2 + trans_output[0, 1] ** 2)
             w, h = (bbox[3] - bbox[1]) / 2 * c, (bbox[2] - bbox[0]) / 2 * c
             unbounded_bbox = [center_point_g[0, 0, 0] - h, center_point_g[0, 0, 1] - w, center_point_g[0, 0, 0] + h,
-                    center_point_g[0, 0, 1] + w]
+                              center_point_g[0, 0, 1] + w]
             bbox = [0] * 4
             bbox[0::2] = np.clip(unbounded_bbox[0::2], 0, image_w)
             bbox[1::2] = np.clip(unbounded_bbox[1::2], 0, image_h)
@@ -246,11 +233,8 @@ class TolokaDataset(Dataset):
                 bbox = [int(b / self.down_ratio) for b in bbox]
                 class_index = self.label_dict.get(anno["annotation"], 5)
                 center_map[class_index, :, :] = draw_gaussian(center_map[class_index, :, :], bbox, gaussian_bias, sigma)
-                # wh_map[0, bbox[0]:bbox[2], bbox[1]:bbox[3]] = w
-                # wh_map[1, bbox[0]:bbox[2], bbox[1]:bbox[3]] = h
                 wh_map[0, :, :] = draw_gaussian(wh_map[0, :, :], bbox, gaussian_bias, sigma, (bbox[3] - bbox[1]) // 2)
                 wh_map[1, :, :] = draw_gaussian(wh_map[1, :, :], bbox, gaussian_bias, sigma, (bbox[2] - bbox[0]) // 2)
-                # center_point = np.array([(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2], dtype=np.float32)
 
         # map = np.zeros((wh_map.shape[1], wh_map.shape[2], 3))
         # map[:, :, 0] = wh_map[0, :, :]
@@ -259,13 +243,12 @@ class TolokaDataset(Dataset):
         # cv2.imshow("321", map)
         # cv2.imshow("123", image)
         # cv2.waitKey()
-        ship_center = center_map[0,:,:] + center_map[2,:,:] + center_map[3,:,:]
-        obj_center = center_map[1,:,:] + center_map[4,:,:] + center_map[5,:,:]
+        ship_center = center_map[0, :, :] + center_map[2, :, :] + center_map[3, :, :]
+        obj_center = center_map[1, :, :] + center_map[4, :, :] + center_map[5, :, :]
         super_class_map = np.stack((ship_center, obj_center))
         if self.transforms:
             image = self.transforms(image)
         else:
-           # image = ((image.astype(np.float32) - self.mean) / self.std).transpose(2, 0, 1)
             image = image.astype(np.float32).transpose(2, 0, 1) / 255
 
         # cv2.imshow("qwe", image.numpy().transpose(1,2,0))
@@ -273,9 +256,5 @@ class TolokaDataset(Dataset):
         return {"input": image,
                 "center": center_map.astype(np.float32),
                 "dim": wh_map.astype(np.float32), "weight": self.data.iloc[index, -1].astype(np.float32),
-                "super": super_class_map.astype(np.float32)}
-
-
-
-
-
+                "super": super_class_map.astype(np.float32),
+                "meta": {"name": self.data.iloc[index, 0].replace(self.path_mappping[0], self.path_mappping[1])}}

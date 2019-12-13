@@ -7,5 +7,5 @@ class Logger:
 
     def log(self, epoch, train_info, val_info):
         message = "{0}:train {1}, val :{2}\n".format(epoch, train_info, val_info)
-        with open(self.path, "a") as  file:
+        with open(self.path, "a") as file:
             file.write(message)

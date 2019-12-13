@@ -1,5 +1,4 @@
 import torch
-from numpy import recarray
 from torch.nn import DataParallel
 from tqdm import tqdm
 import sys
@@ -21,7 +20,7 @@ class ModelWithLoss(torch.nn.Module):
         loss_value = 0
         loss_stats = {key: 0.0 for key in self.loss}
         for key, loss in self.loss.items():
-            loss_stats[key] = batch["weight"] * loss(outputs[-1][key], batch[key])
+            loss_stats[key] = loss(outputs[-1][key], batch[key])
 
         loss_value += sum({key: self.loss_weights[key] * val for key, val in loss_stats.items()}.values())
         return outputs[-1], loss_value, loss_stats
@@ -101,8 +100,19 @@ class Trainer(object):
                 else:
                     with torch.no_grad():
                         output = model_with_loss.model(batch['input'])[-1]
-                        rectangles = self.predict(output, image_id=iter_id // len(scales), down_ratio=4)
-                        results.extend(rectangles)
+                        rectangles = self.predict(output, image_id=iter_id // len(scales), down_ratio=4,
+                                                  scale=scales[iter_id % len(scales)])
+                        current_predict.extend(rectangles)
+                        if not ((iter_id + 1) % len(scales)):
+                            current_predict = self.nms(current_predict)
+                            predicts.extend(current_predict)
+                            if debug:
+                                cv2.startWindowThread()
+                                img = (batch['input'][0, :, :, :].cpu().numpy().transpose(1, 2, 0) * 255).astype(
+                                    np.uint8).copy()
+                                self.visualize(img, current_predict, output["center"], batch["meta"])
+                            current_predict = []
+
                 if phase == 'train':
                     if iter_id % self.batches_per_update == 0:
                         self.optimizer.zero_grad()
@@ -126,8 +136,8 @@ class Trainer(object):
         if phase != "test":
             results = {k: v / len(data_loader) for k, v in results.items()}
             results.update({'loss': moving_loss / len(data_loader)})
-
-        return (results, predicts) if require_predict else results
+            return (results, predicts) if require_predict else results
+        return predicts
 
     def val(self, epoch, data_loader, require_predict=False):
         return self.run_epoch('val', epoch, data_loader, require_predict)
@@ -136,21 +146,21 @@ class Trainer(object):
         return self.run_epoch('train', epoch, data_loader, require_predict=False)
 
     def test(self, epoch, data_loader):
-        return self.run_epoch("test", epoch, data_loader, require_predict=False)
+        return self.run_epoch("test", epoch, data_loader, require_predict=True)
 
     def predict(self, output, image_id, down_ratio=4, scale=1):
-        debug = False
-        super_class_dict = {0:0, 1:1, 2:0, 3:0,4:1,5:1}
-        extrema_map = (max_pool2d(output["center"], 2 * self.window_r + 1, stride=1) ==
-                       output['center'][:, :, self.window_r:-self.window_r, self.window_r:-self.window_r]).cpu()
+        any_class_map = output["center"].max(1, keepdim=True)[0]
+        radius = max(1, int(self.window_r / scale + 0.5))
+        extrema_map = (max_pool2d(any_class_map, 2 * radius + 1, stride=1) ==
+                       any_class_map[:, :, radius:-radius, radius:-radius]).cpu()
         points = extrema_map.nonzero()
 
-        smooth_wh = (max_pool2d(output['dim'], 2 * self.window_r + 1, stride=1)).cpu()
+        smooth_wh = (max_pool2d(output['dim'], 2 * radius + 1, stride=1)).cpu()
         w = smooth_wh[0, 0, points[:, 2], points[:, 3]]
         h = smooth_wh[0, 1, points[:, 2], points[:, 3]]
 
-        points[:, 2:] += self.window_r
-        cost = output['center'][0, points[:, 1], points[:, 2], points[:, 3]]
+        points[:, 2:] += radius
+        cost = any_class_map[0, points[:, 1], points[:, 2], points[:, 3]]
         costs, idx = cost.topk(min(self.K, cost.shape[0]))
         num_good = (costs.sigmoid() > self.thr).sum()
         idx = idx[:num_good]
@@ -159,14 +169,16 @@ class Trainer(object):
             rect = (int(points[i, 2].item() * down_ratio - h[i].item() * down_ratio) * scale,
                     int(points[i, 3].item() * down_ratio - w[i].item() * down_ratio) * scale,
                     int(2 * h[i].item()) * scale * down_ratio, int(2 * w[i].item()) * scale * down_ratio)
-            anno = super_class_dict[points[i, 1].item()]
+            anno = output["center"][0, :, points[i, 2], points[i, 3]].argmax().item()
             result.append({"image_id": image_id, "bbox": rect, "category_id": anno, "score": cost[i].sigmoid().item()})
         return result
 
-    def nms(self, boxes, thr=0.0):
-        boxes = list(sorted(boxes, key=functools.cmp_to_key(lambda x,y: y["score"]-x["score"])))
+    @staticmethod
+    def nms(boxes, thr=0.75):
+        boxes = list(sorted(boxes, key=functools.cmp_to_key(lambda x, y: y["score"]-x["score"])))
         for i, box in enumerate(boxes):
             rect = np.array(box["bbox"])
+            eta_box = rect.copy()
             for box2 in boxes[i+1:]:
 
                 rect2 = np.array(box2["bbox"])
@@ -182,15 +194,25 @@ class Trainer(object):
                         rect[2] * rect[3] + rect2[3] * rect2[2] - intersection_area)
                 if iou > thr:
                     boxes.remove(box2)
+                    eta_box[0] = eta_box[0]
         return boxes
 
-    def visualize(self, img, boxes):
+    @staticmethod
+    def visualize(img, boxes, center=None, meta=None):
+        class_colors = [(255, 0, 0), (255, 255, 0), (255, 255, 255), (255, 0, 255), (0, 255, 255), (0, 0, 0)]
+        class_names = ["boat", "buoy", "vessel", "military", "ice", "other"]
         for box in boxes:
             rect = box["bbox"]
-            score = box["score"]
+            anno = box["category_id"]
             cv2.rectangle(img, (rect[1], rect[0]), (rect[3] + rect[1], rect[2] + rect[0]),
-                          (255, int(255 * score), 0), 2)
+                          class_colors[anno], 2)
+            cv2.putText(img, class_names[anno], (rect[1], rect[0] + rect[2]), cv2.FONT_HERSHEY_PLAIN, 2,
+                        class_colors[anno], 3)
         cv2.imshow("123", img)
-        cv2.waitKey()
-
-
+        center_img = cv2.resize(center.max(dim=1)[0].sigmoid().cpu().numpy()[0, :, :], (img.shape[1], img.shape[0]))
+        cv2.imshow("center", center_img)
+        key = cv2.waitKey()
+        if key == ord("s"):
+            cv2.imwrite("/opt/project/exp/images/" + meta["name"][0].replace("/", "_"), img)
+            cv2.imwrite("/opt/project/exp/images/center_" + meta["name"][0].replace("/", "_"),
+                        (center_img*255).astype(np.uint8))

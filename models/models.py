@@ -9,16 +9,16 @@ _model_factory = {
 }
 
 
-def create_model(arch, heads, head_conv):
+def create_model(arch, heads, head_conv, attention):
     num_layers = int(arch[arch.find('_') + 1:]) if '_' in arch else 0
     arch = arch[:arch.find('_')] if '_' in arch else arch
     get_model = _model_factory[arch]
-    model = get_model(num_layers=num_layers, heads=heads, head_conv=head_conv)
+    model = get_model(heads=heads, head_conv=head_conv, attention=attention)
     return model
 
 
 def load_model(model, model_path, optimizer=None, resume=False,
-               lr=None, lr_step=None):
+               lr=None, lr_step=None, lr_factor=0.1, epoch=None):
     start_epoch = 0
     checkpoint = torch.load(model_path, map_location=lambda storage, loc: storage)
     print('loaded {}, epoch {}'.format(model_path, checkpoint['epoch']))
@@ -39,10 +39,20 @@ def load_model(model, model_path, optimizer=None, resume=False,
                       'loaded shape{}.'.format(
                     k, model_state_dict[k].shape, state_dict[k].shape))
                 state_dict[k] = model_state_dict[k]
+        elif "backbone." + k in model_state_dict:
+            if state_dict[k].shape != model_state_dict["backbone." + k].shape:
+                state_dict[k] = model_state_dict["backbone." + k]
+                print('Skip loading parameter {}, required shape{}, ' \
+                      'loaded shape{}.'.format(
+                    k, model_state_dict["backbone." + k].shape, state_dict[k].shape))
         else:
             print('Drop parameter {}.'.format(k))
+
     for k in model_state_dict:
-        if not (k in state_dict):
+        if ".".join(k.split(".")[1:]) in state_dict:
+            state_dict[k] = state_dict[".".join(k.split(".")[1:])]
+            del state_dict[".".join(k.split(".")[1:])]
+        elif not (k in state_dict):
             print('No param {}.'.format(k))
             state_dict[k] = model_state_dict[k]
     model.load_state_dict(state_dict, strict=False)
@@ -52,11 +62,11 @@ def load_model(model, model_path, optimizer=None, resume=False,
             optimizer.load_state_dict(checkpoint['optimizer'])
         except:
             print('No optimizer parameters in checkpoint.')
-        start_epoch = checkpoint['epoch']
+        start_epoch = epoch if epoch else checkpoint['epoch']
         start_lr = lr
         for step in lr_step:
             if start_epoch >= step:
-                start_lr *= 0.1
+                start_lr /= lr_factor
         for param_group in optimizer.param_groups:
             param_group['lr'] = start_lr
         print('Resumed optimizer with start lr', start_lr)

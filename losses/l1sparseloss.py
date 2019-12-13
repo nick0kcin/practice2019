@@ -16,7 +16,7 @@ class L1SparseLoss(Module):
         gt_wh = gt[points[:, 0], points[:, 1], points[:, 2], points[:, 3]]
         pred_wh = pred[points[:, 0], points[:, 1], points[:, 2], points[:, 3]]
 
-        return l1_loss(pred_wh,  gt_wh, reduction="sum") /(gt_wh.shape[0] + 1e-04)
+        return l1_loss(pred_wh,  gt_wh, reduction="sum") / (gt_wh.shape[0] + 1e-04)
 
 
 def get_l1_sparse_loss():

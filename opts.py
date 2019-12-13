@@ -8,6 +8,8 @@ class opts(object):
 
         self.parser.add_argument('--gray', action='store_true', help='convert rgb images to gray')
 
+        self.parser.add_argument('--test', action='store_true', help='compute metrics only')
+
         self.parser.add_argument('--exp_id', default='default')
 
         self.parser.add_argument('--load_model', default='',
@@ -43,10 +45,13 @@ class opts(object):
         self.parser.add_argument('--input_res', type=int, default=512,
                                  help='input height and width. -1.')
 
+        self.parser.add_argument('--attention', action='store_true',
+                                 help='use attention')
+
         self.parser.add_argument('--lr', type=float, default=1.25e-4,
                                  help='learning rate')
 
-        self.parser.add_argument('--lr_step', type=str, default= '30, 60',
+        self.parser.add_argument('--lr_step', type=str, default='4, 20, 50, 90',
                                  help='drop learning rate by lr_factor')
 
         self.parser.add_argument('--lr_factor', type=float, default='3',
@@ -67,17 +72,17 @@ class opts(object):
         self.parser.add_argument('--val_intervals', type=int, default=1,
                                  help='number of epochs to run validation.')
 
-        self.parser.add_argument('--test_intervals', type=int, default=10,
+        self.parser.add_argument('--test_intervals', type=int, default=100,
                                  help='number of validation runs to run metrics computation')
 
         self.parser.add_argument("--batches_per_update", type=int, default=1,
                                  help="number of processed batches per one weights update")
 
-        self.parser.add_argument('--train_params', type=int, default='0',
+        self.parser.add_argument('--train_params', type=int, default='1',
                                  help='name of function, which return trainable parameters'
                                  )
 
-        self.parser.add_argument('--train_params_step', type=str, default='2',
+        self.parser.add_argument('--train_params_step', type=str, default='5',
                                  help='step  to change  trainable parameters'
                                  )
 
